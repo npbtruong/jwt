@@ -1,0 +1,99 @@
+# docker-compose.yml — dùng cho DEV (mặc định khi chạy `docker compose ...`)
+name: laraveldocker
+
+services:
+  # PHP-FPM: nơi chạy Laravel, artisan, composer...
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: laraveldocker-app
+    container_name: ld_app
+    working_dir: /var/www/html
+    volumes:
+      # Bind mount toàn bộ source: sửa code PHP/Blade là F5 thấy ngay, không cần build lại.
+      - ./:/var/www/html
+    depends_on:
+      - db
+      - redis
+    networks:
+      - laravel
+
+  # Nginx: web server, reverse proxy sang php-fpm
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ld_nginx
+    ports:
+      # Web app: http://localhost:8080  (tránh 80 mà XAMPP/WAMP hay chiếm)
+      - "8080:80"
+    volumes:
+      - ./:/var/www/html
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    networks:
+      - laravel
+
+  # MariaDB 10.11: dữ liệu nằm trong NAMED VOLUME nên KHÔNG mất khi tắt máy / docker compose down.
+  db:
+    image: mariadb:10.11
+    container_name: ld_db
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE:-laravel}
+      MYSQL_USER: ${DB_USERNAME:-laravel}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-secret}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+    ports:
+      # Bind vào 127.0.0.1: chỉ máy local kết nối được (GUI như DBeaver/TablePlus), KHÔNG lộ ra mạng ngoài.
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - laravel
+
+  # Redis: cache + queue
+  redis:
+    image: redis:7-alpine
+    container_name: ld_redis
+    networks:
+      - laravel
+
+  # phpMyAdmin: UI xem DB tại http://localhost:8081
+  phpmyadmin:
+    image: phpmyadmin:5
+    container_name: ld_pma
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+      UPLOAD_LIMIT: 256M
+    ports:
+      - "8081:80"
+    depends_on:
+      - db
+    networks:
+      - laravel
+
+  # Node 20: chạy npm / vite build assets. Container giữ sống để `exec` vào dùng.
+  node:
+    image: node:20-alpine
+    container_name: ld_node
+    working_dir: /var/www/html
+    volumes:
+      - ./:/var/www/html
+    ports:
+      - "5173:5173" # Vite dev server / HMR
+    command: sh -c "tail -f /dev/null"
+    networks:
+      - laravel
+
+volumes:
+  dbdata:
+
+networks:
+  laravel:
+    driver: bridge

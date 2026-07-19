@@ -1,0 +1,21 @@
+# Không đưa các thứ này vào build context / image
+vendor/
+node_modules/
+.env
+.env.*
+!.env.example
+.git/
+.gitignore
+.idea/
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+public/hot
+public/storage
+npm-debug.log
+yarn-error.log
+Dockerfile
+docker-compose*.yml
+.dockerignore
+README.md

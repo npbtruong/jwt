@@ -1,0 +1,45 @@
+# docker-compose.prod.yml — OVERRIDE cho PRODUCTION
+# Chạy kèm file dev:  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Khác biệt so với DEV:
+#   - app/nginx KHÔNG bind mount source: dùng đúng code đã COPY trong image.
+#     Code được đưa vào NAMED VOLUME app_code (Docker tự nạp từ image lần đầu),
+#     nginx mount read-only cùng volume này để phục vụ file tĩnh trong public/.
+#   - DB không mở cổng ra ngoài (chỉ dùng nội bộ mạng docker qua host "db").
+#   - Không có phpmyadmin / node (gắn profile "tools" nên không tự chạy ở prod).
+#
+# LƯU Ý deploy lại khi đổi code: named volume chỉ nạp từ image LẦN ĐẦU.
+#   Sau khi build image mới, phải làm mới volume để lấy code mới:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml down
+#   docker volume rm laraveldocker_app_code
+#   ... rồi up --build lại.
+
+services:
+  app:
+    volumes:
+      # Thay bind mount của dev bằng named volume chứa code từ image.
+      - app_code:/var/www/html
+    restart: unless-stopped
+
+  nginx:
+    volumes:
+      - app_code:/var/www/html:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  db:
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped
+
+  # Dịch vụ chỉ dành cho dev: gắn profile "tools" => KHÔNG chạy ở prod
+  # (vì lệnh prod ở trên không kích hoạt profile "tools").
+  phpmyadmin:
+    profiles: ["tools"]
+
+  node:
+    profiles: ["tools"]
+
+volumes:
+  app_code:
