@@ -14,8 +14,12 @@ services:
       # Bind mount toàn bộ source: sửa code PHP/Blade là F5 thấy ngay, không cần build lại.
       - ./:/var/www/html
     depends_on:
-      - db
-      - redis
+      # Chờ DB thật sự sẵn sàng (healthy) chứ không chỉ "đã khởi động",
+      # tránh lỗi connection refused khi artisan chạy quá sớm.
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
     networks:
       - laravel
 
@@ -34,10 +38,13 @@ services:
     networks:
       - laravel
 
-  # MariaDB 10.11: dữ liệu nằm trong NAMED VOLUME nên KHÔNG mất khi tắt máy / docker compose down.
-  db:
-    image: mariadb:10.11
-    container_name: ld_db
+  # MySQL 8: dữ liệu nằm trong NAMED VOLUME nên KHÔNG mất khi tắt máy / docker compose down.
+  # Cùng image + cùng tên service với nhánh webhook => .env dùng chung DB_HOST=mysql,
+  # đổi nhánh chỉ cần sửa DB_DATABASE.
+  mysql:
+    image: mysql:8.0
+    container_name: ld_mysql
+    command: --default-authentication-plugin=caching_sha2_password
     environment:
       MYSQL_DATABASE: ${DB_DATABASE:-laravel}
       MYSQL_USER: ${DB_USERNAME:-laravel}
@@ -47,12 +54,12 @@ services:
       # Bind vào 127.0.0.1: chỉ máy local kết nối được (GUI như DBeaver/TablePlus), KHÔNG lộ ra mạng ngoài.
       - "127.0.0.1:3306:3306"
     volumes:
-      - dbdata:/var/lib/mysql
+      - mysqldata:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
     networks:
       - laravel
 
@@ -68,13 +75,13 @@ services:
     image: phpmyadmin:5
     container_name: ld_pma
     environment:
-      PMA_HOST: db
+      PMA_HOST: mysql
       PMA_PORT: 3306
       UPLOAD_LIMIT: 256M
     ports:
       - "8081:80"
     depends_on:
-      - db
+      - mysql
     networks:
       - laravel
 
@@ -92,7 +99,7 @@ services:
       - laravel
 
 volumes:
-  dbdata:
+  mysqldata:
 
 networks:
   laravel:

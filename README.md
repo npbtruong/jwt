@@ -16,7 +16,7 @@ Môi trường Laravel **được Docker hoá đầy đủ** — máy bạn **ch
 |---|---|---|
 | PHP 8.3 (php-fpm) | build từ `Dockerfile` (Alpine) | extension: pdo_mysql, bcmath, gd, zip, intl, mbstring, exif, pcntl, opcache, **redis** (pecl) + Composer |
 | Nginx | `nginx:1.27-alpine` | reverse proxy → php-fpm:9000, root `public/` |
-| MariaDB | `mariadb:10.11` | dữ liệu trong **named volume** (không mất khi tắt máy) |
+| MySQL 8 | `mysql:8.0` | dữ liệu trong **named volume** (không mất khi tắt máy) |
 | Redis | `redis:7-alpine` | cache + queue |
 | phpMyAdmin | `phpmyadmin:5` | UI xem DB |
 | Node 20 | `node:20-alpine` | chạy npm / vite |
@@ -31,9 +31,9 @@ Môi trường Laravel **được Docker hoá đầy đủ** — máy bạn **ch
 | `.dockerignore` | Chặn `vendor/`, `node_modules/`, `.env`, `.git/`, `storage/logs` khỏi build context. |
 | `docker/nginx/default.conf` | Config Nginx: trỏ `public/`, chuyển `.php` sang `app:9000`. |
 | `docker/php/php.ini` | Tinh chỉnh PHP (memory, upload, opcache dev-friendly). |
-| `docker-compose.yml` | **DEV**: app, nginx, db, redis, phpmyadmin, node. Bind mount code để sửa là thấy ngay. |
+| `docker-compose.yml` | **DEV**: app, nginx, mysql, redis, phpmyadmin, node. Bind mount code để sửa là thấy ngay. |
 | `docker-compose.prod.yml` | Override **PROD**: không bind mount code, DB không lộ ra ngoài, không phpmyadmin/node. |
-| `.env.example` | Đã cấu hình sẵn `DB_HOST=db`, `REDIS_HOST=redis`, `CACHE_STORE=redis`, `QUEUE_CONNECTION=redis`. |
+| `.env.example` | Đã cấu hình sẵn `DB_HOST=mysql`, `REDIS_HOST=redis`, `CACHE_STORE=redis`, `QUEUE_CONNECTION=redis`. |
 | `Makefile` | Lệnh tắt: `up`, `down`, `shell`, `artisan`, `composer`, `npm`, `migrate`, `fresh`... |
 
 ---
@@ -46,7 +46,7 @@ Môi trường Laravel **được Docker hoá đầy đủ** — máy bạn **ch
 # 1) Build image PHP (lần đầu chưa có Laravel nên composer install trong Dockerfile được bỏ qua)
 docker compose build
 
-# 2) Bật các service nền (db, redis...) — cần db chạy trước khi migrate
+# 2) Bật các service nền (mysql, redis...) — cần mysql chạy trước khi migrate
 docker compose up -d
 
 # 3) Tạo Laravel MỚI ngay trong container app (KHÔNG cần PHP trên Windows)
@@ -68,7 +68,7 @@ docker compose exec app cp .env.example .env
 # 7) Sinh APP_KEY
 docker compose exec app php artisan key:generate
 
-# 8) Chạy migrate (kết nối tới service "db")
+# 8) Chạy migrate (kết nối tới service "mysql")
 docker compose exec app php artisan migrate
 ```
 
@@ -86,7 +86,7 @@ Xong! Mở <http://localhost:8080>.
 > (Bước `cp .env.example .env`: chạy `docker compose exec app cp .env.example .env` hoặc copy tay.)
 
 ### Vì sao thứ tự này?
-`build` (tạo image có PHP/Composer) → `up` (db/redis sẵn sàng) → **tạo Laravel** (vì máy chưa có code) → `composer install` (vendor) → **cấp quyền storage** (php-fpm chạy dưới `www-data` cần ghi được `storage/`) → `cp .env` (cấu hình) → `key:generate` (khoá app) → `migrate` (tạo bảng, cần db đã chạy).
+`build` (tạo image có PHP/Composer) → `up` (mysql/redis sẵn sàng) → **tạo Laravel** (vì máy chưa có code) → `composer install` (vendor) → **cấp quyền storage** (php-fpm chạy dưới `www-data` cần ghi được `storage/`) → `cp .env` (cấu hình) → `key:generate` (khoá app) → `migrate` (tạo bảng, cần mysql đã chạy).
 
 ---
 
@@ -118,9 +118,9 @@ docker compose exec node npm run build
 
 ---
 
-## Dữ liệu MariaDB (quan trọng)
+## Dữ liệu MySQL (quan trọng)
 
-- DB nằm trong **named volume** `laraveldocker_dbdata` → `docker compose down` / tắt máy **KHÔNG mất data**.
+- DB nằm trong **named volume** `laraveldocker_mysqldata` → `docker compose down` / tắt máy **KHÔNG mất data**.
 - ⚠️ **`docker compose down -v` sẽ XOÁ volume → mất toàn bộ dữ liệu DB.** Chỉ dùng khi thực sự muốn reset sạch.
 - Cổng DB bind vào `127.0.0.1:3306` → chỉ kết nối được từ máy local (DBeaver/TablePlus...), không lộ ra mạng ngoài.
 
@@ -156,7 +156,7 @@ Kiểm tra cổng đang bị chiếm trên Windows (PowerShell): `netstat -ano |
 
 ## Xử lý sự cố nhanh
 
-- **`php artisan migrate` báo không kết nối được DB**: đợi db khởi động xong (`docker compose ps` thấy db `healthy`), rồi chạy lại. Đảm bảo `.env` có `DB_HOST=db`.
+- **`php artisan migrate` báo không kết nối được DB**: đợi mysql khởi động xong (`docker compose ps` thấy mysql `healthy`), rồi chạy lại. Đảm bảo `.env` có `DB_HOST=mysql`.
 - **Lỗi quyền ghi `storage/` hoặc `bootstrap/cache/`**: `docker compose exec app sh -lc "chmod -R ug+rw storage bootstrap/cache"`.
 - **Đổi extension/PHP version không ăn**: `make rebuild` (build lại không cache).
 - **Trang trắng / 502**: xem log `docker compose logs -f app nginx`.
