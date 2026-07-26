@@ -27,6 +27,7 @@ Homestead.yaml
 Thumbs.db
 
 # --- Bổ sung: Docker / Windows / rác local ---
+/.claude/settings.local.json
 /nul
 /docker-compose.override.yml
 /.docker-data
