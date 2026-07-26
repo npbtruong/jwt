@@ -1,162 +1,292 @@
-# Laravel + Docker (Windows / WSL2 + Docker Desktop)
+# Webhook Receiver — OTA Reservation Microservice
 
-Môi trường Laravel **được Docker hoá đầy đủ** — máy bạn **chỉ cần Docker**, KHÔNG cần cài PHP/Composer/Node trên Windows. Mọi lệnh đều chạy trong container.
+A small, production-shaped Laravel microservice that ingests reservation
+webhooks from an OTA (Booking.com), authenticates them with **JWT**, persists
+each reservation **synchronously** to its own **MySQL** database, and sends the
+guest a notification email **asynchronously** via a **Redis-backed queue**.
 
-- Web app: <http://localhost:8080>
-- phpMyAdmin: <http://localhost:8081>
-- Vite HMR (khi `npm run dev`): cổng `5173`
+It is deliberately minimal in scope but built with the patterns you'd use in a
+real service, so it can be read as a reference for **JWT auth + Redis idempotency
++ Redis queue + clean layering**.
 
-> Ports 8080/8081 được chọn để tránh đụng XAMPP/WAMP đang chạy song song (thường chiếm cổng 80). Nếu vẫn bị trùng, xem mục [Đổi port](#đổi-port-nếu-bị-trùng).
+---
+
+## What it does (the flow)
+
+```
+                POST /api/v1/oauth/token
+  Booking.com  ───────────────────────────►  AuthController
+   (server)     { client_id, client_secret }        │ verify HASHED secret
+                                                     ▼
+                ◄───────────────────────────  short-lived JWT (expires_in)
+
+                POST /api/v1/webhook
+  Booking.com  ───────────────────────────►  [ jwt middleware ]  verify sig+exp, resolve client
+   (server)     Authorization: Bearer <jwt>          │
+                reservation JSON                      ▼
+                                              WebhookService::process
+                                              1. Redis SET NX EX <event_id>  ── duplicate? ─► 200 "already processed"
+                                              2. DB transaction: upsert reservation   (SYNC — done before responding)
+                                              3. dispatch email job ->afterCommit()    (onto "notifications" queue)
+                ◄───────────────────────────  200 { reservation_id, event_id }
+                                                     │
+                             (separate worker container)
+                                                     ▼
+                                     queue:work redis --queue=notifications
+                                     sends mail · retries $tries/$backoff · failure → failed_jobs + log
+```
+
+### The patterns worth studying
+- **Atomic idempotency** — a single Redis `SET <key> 1 EX <ttl> NX` decides
+  "have we seen this `event_id`?". Concurrent OTA retries can never both win.
+  See `app/Support/Idempotency/RedisIdempotencyStore.php`.
+- **After-commit dispatch** — the email job is queued with `->afterCommit()`
+  *inside* the DB transaction, so it never fires if the write rolls back.
+  See `app/Services/Webhook/WebhookService.php`.
+- **Hashed secrets** — clients store a bcrypt hash; the raw secret is verified
+  with `Hash::check()` (constant-time) and never persisted.
+- **Consistent envelope** — one `ApiResponse` helper + one exception `Handler`
+  produce the same JSON shape for success (200), validation (422), auth (401)
+  and duplicates (200). This is the service's stable public contract.
+- **Sync persist / async email** — the reservation is durable *before* the 200;
+  the slow SMTP work happens off-request on the worker.
 
 ---
 
 ## Stack
 
-| Thành phần | Image | Ghi chú |
-|---|---|---|
-| PHP 8.3 (php-fpm) | build từ `Dockerfile` (Alpine) | extension: pdo_mysql, bcmath, gd, zip, intl, mbstring, exif, pcntl, opcache, **redis** (pecl) + Composer |
-| Nginx | `nginx:1.27-alpine` | reverse proxy → php-fpm:9000, root `public/` |
-| MariaDB | `mariadb:10.11` | dữ liệu trong **named volume** (không mất khi tắt máy) |
-| Redis | `redis:7-alpine` | cache + queue |
-| phpMyAdmin | `phpmyadmin:5` | UI xem DB |
-| Node 20 | `node:20-alpine` | chạy npm / vite |
+| Service     | Image                | Role                                             |
+|-------------|----------------------|--------------------------------------------------|
+| `app`       | build (`php:8.3-fpm`) | HTTP API (php-fpm)                               |
+| `nginx`     | `nginx:1.27-alpine`  | reverse proxy → `app:9000`, docroot `public/`    |
+| `worker`    | same as `app`        | `queue:work` on the `notifications` queue        |
+| `mysql`     | `mysql:8.0`          | this service's own database (named volume)       |
+| `redis`     | `redis:7-alpine`     | idempotency store **and** queue backend          |
+| `phpmyadmin`| `phpmyadmin:5`       | optional DB UI at <http://localhost:8081>        |
+
+No third-party PHP packages are required — the JWT codec is a small,
+dependency-free HS256 implementation (`app/Support/Jwt/HmacJwtCodec.php`).
 
 ---
 
-## Các file trong project
+## Setup (from a clean clone)
 
-| File | Vai trò |
-|---|---|
-| `Dockerfile` | Image PHP-fpm: cài extension + Composer; COPY code + `composer install --no-dev` để dùng cho **build production**. |
-| `.dockerignore` | Chặn `vendor/`, `node_modules/`, `.env`, `.git/`, `storage/logs` khỏi build context. |
-| `docker/nginx/default.conf` | Config Nginx: trỏ `public/`, chuyển `.php` sang `app:9000`. |
-| `docker/php/php.ini` | Tinh chỉnh PHP (memory, upload, opcache dev-friendly). |
-| `docker-compose.yml` | **DEV**: app, nginx, db, redis, phpmyadmin, node. Bind mount code để sửa là thấy ngay. |
-| `docker-compose.prod.yml` | Override **PROD**: không bind mount code, DB không lộ ra ngoài, không phpmyadmin/node. |
-| `.env.example` | Đã cấu hình sẵn `DB_HOST=db`, `REDIS_HOST=redis`, `CACHE_STORE=redis`, `QUEUE_CONNECTION=redis`. |
-| `Makefile` | Lệnh tắt: `up`, `down`, `shell`, `artisan`, `composer`, `npm`, `migrate`, `fresh`... |
-
----
-
-## Thiết lập lần đầu (chạy theo đúng thứ tự)
-
-> Mở terminal trong WSL2 (hoặc Git Bash / PowerShell) tại thư mục project. Không cần PHP/Composer/Node trên host.
+> Only Docker is required on your machine — no PHP/Composer locally.
 
 ```bash
-# 1) Build image PHP (lần đầu chưa có Laravel nên composer install trong Dockerfile được bỏ qua)
-docker compose build
+# 1) Environment file
+cp .env.example .env
 
-# 2) Bật các service nền (db, redis...) — cần db chạy trước khi migrate
-docker compose up -d
+# 2) Build images and start everything (app, nginx, worker, mysql, redis)
+docker compose up -d --build
 
-# 3) Tạo Laravel MỚI ngay trong container app (KHÔNG cần PHP trên Windows)
-#    Tạo vào /tmp rồi copy nội dung sang bằng tar (cp của Alpine/BusyBox không copy đúng
-#    cú pháp "thư mục/." nên phải dùng tar). Xoá README/.env.example/.env của bản Laravel
-#    trước khi copy để GIỮ NGUYÊN README.md và .env.example đã cấu hình sẵn của repo này.
-docker compose run --rm --no-deps app sh -lc 'set -e; composer create-project laravel/laravel /tmp/app --prefer-dist --no-interaction; rm -f /tmp/app/README.md /tmp/app/.env.example /tmp/app/.env; ( cd /tmp/app && tar cf - . ) | ( cd /var/www/html && tar xf - )'
-
-# 4) Cài dependencies (thường bước 3 đã cài; chạy lại cho chắc)
-docker compose exec app composer install
-
-# 5) Cấp quyền ghi cho www-data (php-fpm) trên storage/ và bootstrap/cache/
-#    Nếu bỏ qua bước này sẽ bị lỗi 500 "tempnam(): file created in the system's temporary directory".
-docker compose exec app sh -lc "chown -R www-data:www-data storage bootstrap/cache && chmod -R ug+rwX storage bootstrap/cache"
-
-# 6) Tạo file .env từ .env.example (bản đã cấu hình sẵn DB/Redis)
-docker compose exec app cp .env.example .env
-
-# 7) Sinh APP_KEY
+# 3) Application key + a dedicated JWT secret
 docker compose exec app php artisan key:generate
+docker compose exec app sh -lc 'php -r "echo \"JWT_SECRET=\".bin2hex(random_bytes(32)).PHP_EOL;"'
+#   → paste the printed JWT_SECRET=... line into your .env, then:
+docker compose exec app php artisan config:clear
 
-# 8) Chạy migrate (kết nối tới service "db")
-docker compose exec app php artisan migrate
+# 4) Create tables and seed one test client (prints its id + raw secret)
+docker compose exec app php artisan migrate --seed
 ```
 
-Xong! Mở <http://localhost:8080>.
+The seeder prints:
 
-> **Dùng Makefile cho gọn** (nếu có `make`):
-> ```bash
-> make build && make up
-> make create-laravel      # bước 3
-> make install             # bước 4
-> make perms               # bước 5 (cấp quyền storage)
-> make artisan cmd="key:generate"   # hoặc: make key (bước 7)
-> make migrate             # bước 8
-> ```
-> (Bước `cp .env.example .env`: chạy `docker compose exec app cp .env.example .env` hoặc copy tay.)
-
-### Vì sao thứ tự này?
-`build` (tạo image có PHP/Composer) → `up` (db/redis sẵn sàng) → **tạo Laravel** (vì máy chưa có code) → `composer install` (vendor) → **cấp quyền storage** (php-fpm chạy dưới `www-data` cần ghi được `storage/`) → `cp .env` (cấu hình) → `key:generate` (khoá app) → `migrate` (tạo bảng, cần db đã chạy).
-
----
-
-## Lệnh dùng hằng ngày
-
-| Việc | Lệnh docker | Makefile |
-|---|---|---|
-| Bật / tắt | `docker compose up -d` / `down` | `make up` / `make down` |
-| Vào shell app | `docker compose exec app sh` | `make shell` |
-| Artisan | `docker compose exec app php artisan <cmd>` | `make artisan cmd="<cmd>"` |
-| Composer | `docker compose exec app composer <cmd>` | `make composer cmd="<cmd>"` |
-| Migrate | `docker compose exec app php artisan migrate` | `make migrate` |
-| Làm mới DB + seed | `docker compose exec app php artisan migrate:fresh --seed` | `make fresh` |
-| npm | `docker compose exec node npm <cmd>` | `make npm cmd="<cmd>"` |
-| Vite dev (HMR) | `docker compose exec node npm run dev` | `make npm-dev` |
-| Xem log | `docker compose logs -f` | `make logs` |
-
-### Sửa code — F5 thấy ngay
-Nhờ bind mount `./:/var/www/html`, mọi thay đổi **PHP/Blade** có hiệu lực ngay (opcache đã bật `validate_timestamps`). **Chỉ cần build lại image** (`make rebuild`) khi bạn đổi `Dockerfile` (extension/PHP version).
-
-### Frontend (Vite)
-```bash
-docker compose exec node npm install
-docker compose exec node npm run dev   # HMR ở cổng 5173
-# hoặc build tĩnh:
-docker compose exec node npm run build
 ```
-Để HMR chạy được từ trình duyệt host, đảm bảo `vite.config.js` có `server: { host: '0.0.0.0', hmr: { host: 'localhost' } }`.
+client_id:     booking_com_client
+client_secret: s3cr3t_raw_value   (raw — shown once)
+```
+
+Web entry points: API at <http://localhost:8080>, phpMyAdmin at <http://localhost:8081>.
 
 ---
 
-## Dữ liệu MariaDB (quan trọng)
+## Running & scaling the worker
 
-- DB nằm trong **named volume** `laraveldocker_dbdata` → `docker compose down` / tắt máy **KHÔNG mất data**.
-- ⚠️ **`docker compose down -v` sẽ XOÁ volume → mất toàn bộ dữ liệu DB.** Chỉ dùng khi thực sự muốn reset sạch.
-- Cổng DB bind vào `127.0.0.1:3306` → chỉ kết nối được từ máy local (DBeaver/TablePlus...), không lộ ra mạng ngoài.
-
----
-
-## Chạy chế độ Production (tuỳ chọn)
+The worker runs automatically as its own container (`docker compose up`). Because
+the app is stateless, you can scale workers horizontally and independently of the
+web tier:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# Run 4 worker replicas
+docker compose up -d --scale worker=4
+
+# Watch what the worker is doing
+docker compose logs -f worker
+
+# Restart workers after changing job code (queue workers are long-lived)
+docker compose restart worker
+
+# Inspect / retry failed jobs
+docker compose exec app php artisan queue:failed
+docker compose exec app php artisan queue:retry all
 ```
 
-Ở prod: code lấy từ image (không bind mount), DB không mở ra mạng ngoài, không chạy phpmyadmin/node.
+The worker command (in `docker-compose.yml`):
 
-> ⚠️ **Deploy lại khi đổi code**: named volume `app_code` chỉ nạp code từ image **lần đầu**. Sau khi build image mới, làm mới volume:
-> ```bash
-> docker compose -f docker-compose.yml -f docker-compose.prod.yml down
-> docker volume rm laraveldocker_app_code
-> docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-> ```
-> Nhớ đặt `APP_ENV=production`, `APP_DEBUG=false` trong `.env`.
+```
+php artisan queue:work redis --queue=notifications --tries=3 --backoff=10 --max-time=3600
+```
 
 ---
 
-## Đổi port (nếu bị trùng)
+## Full curl flow
 
-Sửa trong `docker-compose.yml`:
-- Web: đổi `"8080:80"` → ví dụ `"8090:80"` (service `nginx`), rồi cập nhật `APP_URL` trong `.env`.
-- phpMyAdmin: đổi `"8081:80"` → ví dụ `"8091:80"` (service `phpmyadmin`).
+```bash
+# 1) Get a token
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/oauth/token \
+  -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  -d '{"client_id":"booking_com_client","client_secret":"s3cr3t_raw_value"}' \
+  | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
 
-Kiểm tra cổng đang bị chiếm trên Windows (PowerShell): `netstat -ano | findstr :8080`.
+# 2) Send the reservation webhook
+curl -s -X POST http://localhost:8080/api/v1/webhook \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  -d '{
+        "event_id": "evt_9f8c2a1b7d",
+        "event_type": "reservation.created",
+        "reservation": {
+          "ota_reservation_id": "BK-2026-778812",
+          "property_id": "PROP-4471",
+          "guest_name": "Nguyen Van A",
+          "guest_email": "guest@example.com",
+          "check_in": "2026-08-01",
+          "check_out": "2026-08-04",
+          "room_type": "Deluxe Double",
+          "total_amount": 3600000,
+          "currency": "VND",
+          "status": "confirmed"
+        }
+      }'
+# → {"success":true,"message":"Reservation received","data":{"reservation_id":1,"event_id":"evt_9f8c2a1b7d"}}
+
+# 3) Watch the worker send the email (MAIL_MAILER=log → written to the log)
+docker compose logs --tail=20 worker
+docker compose exec app sh -lc 'grep "Reservation confirmed" storage/logs/laravel.log | tail -1'
+
+# 4) Confirm the row landed in MySQL
+docker compose exec mysql mysql -uwebhook -psecret webhook \
+  -e 'SELECT id, event_id, guest_name, total_amount, currency, status FROM reservations;'
+
+# 5) Re-send the SAME event_id → idempotent, no re-insert / no second email
+curl -s -X POST http://localhost:8080/api/v1/webhook -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  -d '{"event_id":"evt_9f8c2a1b7d","event_type":"reservation.created","reservation":{ ... }}'
+# → {"success":true,"message":"Event already processed","data":{"event_id":"evt_9f8c2a1b7d","duplicate":true}}
+```
 
 ---
 
-## Xử lý sự cố nhanh
+## Service Contract
 
-- **`php artisan migrate` báo không kết nối được DB**: đợi db khởi động xong (`docker compose ps` thấy db `healthy`), rồi chạy lại. Đảm bảo `.env` có `DB_HOST=db`.
-- **Lỗi quyền ghi `storage/` hoặc `bootstrap/cache/`**: `docker compose exec app sh -lc "chmod -R ug+rw storage bootstrap/cache"`.
-- **Đổi extension/PHP version không ăn**: `make rebuild` (build lại không cache).
-- **Trang trắng / 502**: xem log `docker compose logs -f app nginx`.
+Consumers depend on this — treat it as the stable interface.
+
+### Response envelope
+
+Every response, on every path, is one of these two shapes:
+
+```jsonc
+// success
+{ "success": true,  "message": "Reservation received", "data": { "reservation_id": 12, "event_id": "evt_9f8c2a1b7d" } }
+
+// error
+{ "success": false, "message": "The given data was invalid.", "errors": { "reservation.check_in": ["The check in field is required."] } }
+```
+
+| Outcome            | HTTP | Shape                                                        |
+|--------------------|------|--------------------------------------------------------------|
+| Success            | 200  | `success:true`, `data`                                       |
+| Duplicate event    | 200  | `success:true`, `message:"Event already processed"`, `data.duplicate:true` |
+| Validation failed  | 422  | `success:false`, `errors{}`                                  |
+| Auth failed        | 401  | `success:false`, `errors:{}`                                 |
+| Not found / other  | 404 / 4xx / 500 | `success:false`, `errors:{}`                     |
+
+### `POST /api/v1/oauth/token`
+
+Exchange client credentials for a short-lived Bearer JWT. Rate limit: `10/min`.
+
+Request:
+```json
+{ "client_id": "booking_com_client", "client_secret": "s3cr3t_raw_value" }
+```
+Response:
+```json
+{ "success": true, "message": "Token issued",
+  "data": { "access_token": "<jwt>", "token_type": "Bearer", "expires_in": 3600 } }
+```
+
+### `POST /api/v1/webhook`
+
+Ingest a reservation. Requires `Authorization: Bearer <jwt>`. Rate limit: `60/min`.
+
+Request body: see the curl example above (`event_id`, `event_type`, nested
+`reservation` object). Response:
+```json
+{ "success": true, "message": "Reservation received",
+  "data": { "reservation_id": 12, "event_id": "evt_9f8c2a1b7d" } }
+```
+
+---
+
+## Project layout
+
+```
+app/
+├── Http/
+│   ├── Controllers/Api/V1/ AuthController · WebhookController   (thin)
+│   ├── Middleware/         JwtMiddleware                        (verify + resolve client)
+│   ├── Requests/           TokenRequest · WebhookRequest        (validation)
+│   └── Resources/          ReservationResource
+├── Services/
+│   ├── Auth/               AuthService                          (verify secret, issue JWT)
+│   └── Webhook/            WebhookService                       (dedupe → tx upsert → afterCommit dispatch)
+├── Repositories/
+│   ├── Contracts/          *RepositoryInterface
+│   ├── ClientRepository.php · ReservationRepository.php
+├── Support/
+│   ├── ApiResponse.php                                         (the envelope)
+│   ├── Idempotency/        RedisIdempotencyStore (SET NX EX)
+│   └── Jwt/                HmacJwtCodec (HS256)
+├── Jobs/                   SendReservationNotificationJob       (ShouldQueue, notifications queue)
+├── Mail/                   ReservationReceivedMail
+├── Models/                 Client · Reservation
+├── Exceptions/             Handler (envelope) + typed exceptions
+└── Providers/              RepositoryServiceProvider            (interface → impl bindings)
+```
+
+Every cross-layer dependency is injected via an **interface** (bound in
+`RepositoryServiceProvider`), so the Redis / DB / JWT implementations can be
+swapped without touching callers.
+
+---
+
+## Configuration reference
+
+All tunable via `.env` (see `.env.example`):
+
+| Group          | Keys                                                             |
+|----------------|-----------------------------------------------------------------|
+| JWT            | `JWT_SECRET`, `JWT_ALGO`, `JWT_TTL`, `JWT_ISSUER`, `JWT_LEEWAY`  |
+| Idempotency    | `IDEMPOTENCY_PREFIX`, `IDEMPOTENCY_TTL`                          |
+| Notifications  | `NOTIFICATIONS_QUEUE`, `NOTIFICATIONS_TRIES`, `NOTIFICATIONS_BACKOFF`, `NOTIFICATIONS_TIMEOUT` |
+| Rate limits    | `RATELIMIT_TOKEN`, `RATELIMIT_WEBHOOK`                           |
+| Infra          | `DB_*` (MySQL), `REDIS_*`, `QUEUE_CONNECTION=redis`, `MAIL_MAILER=log` |
+
+Config files: `config/jwt.php`, `config/idempotency.php`,
+`config/notifications.php`, `config/ratelimit.php`.
+
+---
+
+## Troubleshooting
+
+- **`migrate` can't reach the DB** — wait for `docker compose ps` to show `mysql`
+  as `healthy`, then retry. Confirm `.env` has `DB_HOST=mysql`.
+- **401 on the webhook** — the token expired (`JWT_TTL`, default 1h) or
+  `JWT_SECRET` changed after minting. Get a fresh token.
+- **Email didn't "send"** — with `MAIL_MAILER=log` it's written to
+  `storage/logs/laravel.log`, not an inbox. Check the worker actually ran:
+  `docker compose logs worker`.
+- **Storage not writable (500 on log write)** —
+  `docker compose exec app sh -lc 'chown -R www-data:www-data storage bootstrap/cache'`.
+- **Changed config but no effect** — `docker compose exec app php artisan config:clear`.

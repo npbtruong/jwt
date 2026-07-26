@@ -1,30 +1,30 @@
-# docker-compose.yml — dùng cho DEV (mặc định khi chạy `docker compose ...`)
-name: laraveldocker
+# docker-compose.yml — webhook-receiver microservice (DEV)
+name: webhook-receiver
 
 services:
-  # PHP-FPM: nơi chạy Laravel, artisan, composer...
+  # PHP-FPM: serves the HTTP API (artisan, composer run here too).
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    image: laraveldocker-app
-    container_name: ld_app
+    image: webhook-app
+    container_name: wr_app
     working_dir: /var/www/html
     volumes:
-      # Bind mount toàn bộ source: sửa code PHP/Blade là F5 thấy ngay, không cần build lại.
       - ./:/var/www/html
     depends_on:
-      - db
-      - redis
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
     networks:
-      - laravel
+      - webhook
 
-  # Nginx: web server, reverse proxy sang php-fpm
+  # Nginx: reverse proxy -> app:9000, document root public/.
   nginx:
     image: nginx:1.27-alpine
-    container_name: ld_nginx
+    container_name: wr_nginx
     ports:
-      # Web app: http://localhost:8080  (tránh 80 mà XAMPP/WAMP hay chiếm)
       - "8080:80"
     volumes:
       - ./:/var/www/html
@@ -32,68 +32,76 @@ services:
     depends_on:
       - app
     networks:
-      - laravel
+      - webhook
 
-  # MariaDB 10.11: dữ liệu nằm trong NAMED VOLUME nên KHÔNG mất khi tắt máy / docker compose down.
-  db:
-    image: mariadb:10.11
-    container_name: ld_db
+  # Queue worker: SAME image as app, but runs the notifications queue instead
+  # of serving HTTP. Statelessness lets you scale it independently:
+  #     docker compose up -d --scale worker=4
+  # No container_name so replicas don't collide on a fixed name.
+  worker:
+    image: webhook-app
+    restart: unless-stopped
+    working_dir: /var/www/html
+    command: php artisan queue:work redis --queue=notifications --tries=3 --backoff=10 --max-time=3600 --sleep=1 -v
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      app:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - webhook
+
+  # MySQL 8: this service's OWN database (named volume => survives restarts).
+  mysql:
+    image: mysql:8.0
+    container_name: wr_mysql
+    command: --default-authentication-plugin=caching_sha2_password
     environment:
-      MYSQL_DATABASE: ${DB_DATABASE:-laravel}
-      MYSQL_USER: ${DB_USERNAME:-laravel}
+      MYSQL_DATABASE: ${DB_DATABASE:-webhook}
+      MYSQL_USER: ${DB_USERNAME:-webhook}
       MYSQL_PASSWORD: ${DB_PASSWORD:-secret}
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
     ports:
-      # Bind vào 127.0.0.1: chỉ máy local kết nối được (GUI như DBeaver/TablePlus), KHÔNG lộ ra mạng ngoài.
       - "127.0.0.1:3306:3306"
     volumes:
-      - dbdata:/var/lib/mysql
+      - mysqldata:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
     networks:
-      - laravel
+      - webhook
 
-  # Redis: cache + queue
+  # Redis: idempotency store + queue backend.
   redis:
     image: redis:7-alpine
-    container_name: ld_redis
+    container_name: wr_redis
     networks:
-      - laravel
+      - webhook
 
-  # phpMyAdmin: UI xem DB tại http://localhost:8081
+  # phpMyAdmin (optional): inspect the reservations table at http://localhost:8081
   phpmyadmin:
     image: phpmyadmin:5
-    container_name: ld_pma
+    container_name: wr_pma
     environment:
-      PMA_HOST: db
+      PMA_HOST: mysql
       PMA_PORT: 3306
       UPLOAD_LIMIT: 256M
     ports:
       - "8081:80"
     depends_on:
-      - db
+      - mysql
     networks:
-      - laravel
-
-  # Node 20: chạy npm / vite build assets. Container giữ sống để `exec` vào dùng.
-  node:
-    image: node:20-alpine
-    container_name: ld_node
-    working_dir: /var/www/html
-    volumes:
-      - ./:/var/www/html
-    ports:
-      - "5173:5173" # Vite dev server / HMR
-    command: sh -c "tail -f /dev/null"
-    networks:
-      - laravel
+      - webhook
 
 volumes:
-  dbdata:
+  mysqldata:
 
 networks:
-  laravel:
+  webhook:
     driver: bridge
